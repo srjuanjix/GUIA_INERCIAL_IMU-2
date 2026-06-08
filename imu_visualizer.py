@@ -466,7 +466,7 @@ def make_sky(w, h):
 # Bucle principal
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
-    ap = argparse.ArgumentParser(description="Visualizador 3D IMU Arduino Nano ESP32")
+    ap = argparse.ArgumentParser(description="Visualizador 3D IMU ESP32-S3-Nano")
     ap.add_argument('--port', help="Puerto serie (ej. /dev/ttyACM0, COM3)")
     ap.add_argument('--demo', action='store_true', help="Modo demo sin hardware")
     args = ap.parse_args()
@@ -474,13 +474,14 @@ def main():
     if not args.demo:
         if not SERIAL_OK:
             print("Instala pyserial:  pip install pyserial"); sys.exit(1)
-        port = args.port or '/dev/ttyACM0'
-        if port is None:
+        if args.port:
+            port = args.port
+        else:
             ports = [p.device for p in serial.tools.list_ports.comports()]
-            port = ports[0] if ports else None
+            port = next((p for p in ports if 'ACM' in p), None) or (ports[0] if ports else '/dev/ttyACM0')
         if not port:
             print("No se encontró puerto serie.")
-            print("Usa  --port /dev/ttyACMX  o  --demo  para modo sin hardware.")
+            print("Usa  --port /dev/ttyACM0  o  --demo  para modo sin hardware.")
             sys.exit(1)
         threading.Thread(target=serial_reader, args=(port,), daemon=True).start()
     else:
