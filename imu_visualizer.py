@@ -15,7 +15,7 @@ Controles:
   ESC                    → salir
 """
 import sys
-import os
+import os 
 import math
 import threading
 import time
@@ -41,7 +41,7 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuración
 # ─────────────────────────────────────────────────────────────────────────────
-WIN_W, WIN_H = 1200, 720
+WIN_W, WIN_H = 1400, 920
 FPS     = 60
 BAUD    = 115200
 PANEL_W = 302
@@ -56,11 +56,14 @@ _lock  = threading.Lock()
 _state = dict(roll=0.0, pitch=0.0, yaw=0.0,
               acc_x=0.0, acc_y=0.0, acc_z=1.0,
               rumbo=0.0, baro_alt=0.0, baro_press=101325.0,
-              vel_z=0.0, connected=False)
+              baro_temp=None, vel_z=0.0, connected=False)
 
 _KEY_MAP = {
     'R': 'roll',  'P': 'pitch',  'Y': 'yaw',   'M': 'rumbo',
     'AX': 'acc_x', 'AY': 'acc_y', 'AZ': 'acc_z',
+    # Claves que envía main.cpp (BMP180)
+    'Alt': 'baro_alt', 'Pre': 'baro_press', 'Tmp': 'baro_temp',
+    # Claves alternativas (protocolo original MPU9250)
     'BA': 'baro_alt', 'BP': 'baro_press', 'VZ': 'vel_z',
 }
 
@@ -103,6 +106,7 @@ def demo_runner():
              acc_z=1.0+0.07*math.sin(t*2.2), connected=True,
              baro_alt=3.0*math.sin(t*0.12),
              baro_press=101325 - 34*math.sin(t*0.12),
+             baro_temp=22.5 + 1.5*math.sin(t*0.04),
              vel_z=0.36*math.cos(t*0.12))
         time.sleep(1/50)
 
@@ -352,6 +356,60 @@ class Panel:
         pygame.draw.line(surf, (255,55,55), (cx,ny), (nx,ny), 3)
         pygame.draw.circle(surf, (255,55,55), (nx,ny), 5)
 
+    def _artificial_horizon(self, surf, cx, cy, r, roll, pitch):
+        """Horizonte artificial circular con filtro circular por máscara alpha."""
+        size = r * 3
+        half = size // 2
+
+        # Desplazamiento vertical por cabeceo (45 ° = radio completo)
+        pitch_px = max(-r, min(r, int(pitch * r / 45.0)))
+        horizon_y = half - pitch_px
+
+        # Contenido: cielo + tierra + línea de horizonte
+        tmp = pygame.Surface((size, size))
+        tmp.fill((28, 88, 180))                                              # cielo
+        pygame.draw.rect(tmp, (100, 64, 18), (0, horizon_y, size, size))    # tierra
+        pygame.draw.line(tmp, (255, 255, 255), (0, horizon_y), (size, horizon_y), 2)
+
+        # Marcas de cabeceo cada 10 °
+        for deg in range(-30, 31, 10):
+            if deg == 0:
+                continue
+            py = horizon_y - int(deg * r / 45.0)
+            if 0 < py < size:
+                w = r // 3 if abs(deg) == 10 else r // 2
+                pygame.draw.line(tmp, (200, 200, 200), (half - w, py), (half + w, py), 1)
+
+        # Rotación: alabeo positivo (derecha) → CW en pantalla → pygame rotate(-roll)
+        rotated = pygame.transform.rotate(tmp, -roll)
+        rc       = rotated.get_rect()
+        crop     = pygame.Rect(rc.centerx - r, rc.centery - r, r * 2, r * 2)
+        crop.clamp_ip(pygame.Rect(0, 0, rc.width, rc.height))
+
+        cropped = pygame.Surface((r * 2, r * 2))
+        cropped.blit(rotated, (0, 0), crop)
+
+        # Máscara circular: BLEND_RGBA_MULT con stencil opaco dentro del círculo
+        masked  = cropped.convert_alpha()
+        stencil = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
+        stencil.fill((255, 255, 255, 0))
+        pygame.draw.circle(stencil, (255, 255, 255, 255), (r, r), r)
+        masked.blit(stencil, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+
+        surf.blit(masked, (cx - r, cy - r))
+        pygame.draw.circle(surf, (70, 100, 180), (cx, cy), r, 2)
+
+        # Referencia fija del avión (alas doradas + centro)
+        wing_inner = r // 3
+        wing_outer = r // 3 + r // 3
+        for sx in (-1, 1):
+            x0 = cx + sx * wing_inner
+            x1 = cx + sx * wing_outer
+            pygame.draw.line(surf, (255, 215, 0), (x0, cy), (x1, cy), 3)
+            pygame.draw.line(surf, (255, 215, 0), (x1, cy - 5), (x1, cy + 5), 2)
+        pygame.draw.line(surf, (255, 215, 0), (cx - r // 8, cy), (cx + r // 8, cy), 3)
+        pygame.draw.circle(surf, (255, 215, 0), (cx, cy), 3)
+
     def draw(self, surf, st, fps):
         px    = WIN_W - PANEL_W
         self._y = 14
@@ -390,6 +448,14 @@ class Panel:
                       (px+10, self._y))
             self._y += 24
         self._y += 10
+
+        # ── Horizonte artificial ──────────────────────────────────────────
+        self._section(surf, "HORIZONTE ARTIFICIAL")
+        ah_r  = 68
+        ah_cx = px + PANEL_W // 2
+        ah_cy = self._y + ah_r + 4
+        self._artificial_horizon(surf, ah_cx, ah_cy, ah_r, st['roll'], st['pitch'])
+        self._y = ah_cy + ah_r + 14
 
         # ── Rumbo magnético ───────────────────────────────────────────────
         self._section(surf, "RUMBO MAGNÉTICO")
@@ -436,12 +502,20 @@ class Panel:
                   (px + 10, self._y))
         self._y += 22
 
-        # Presión barométrica (texto auxiliar)
+        # Presión barométrica
         press = st['baro_press']
         if press > 50000:
             surf.blit(self.f_sm.render(f"Press: {int(press)} Pa", True, (65, 115, 150)),
                       (px + 10, self._y))
         self._y += 18
+
+        # Temperatura BMP180 (si disponible)
+        temp = st['baro_temp']
+        if temp is not None:
+            t_col = (255, 160, 60) if temp >= 30 else (100, 200, 255) if temp < 15 else (160, 220, 140)
+            surf.blit(self.f_sm.render(f"Temp:  {temp:.1f} °C", True, t_col),
+                      (px + 10, self._y))
+            self._y += 18
 
         # ── Pie ───────────────────────────────────────────────────────────
         self._y += 10
