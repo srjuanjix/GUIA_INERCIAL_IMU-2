@@ -15,11 +15,12 @@ Controles:
   ESC                    → salir
 """
 import sys
-import os 
+import os
 import math
 import threading
 import time
 import argparse
+import socket
 
 # Fuerza Mesa software renderer — necesario cuando el driver NVIDIA
 # tiene mismatch de versiones entre kernel y librería (hasta próximo reboot).
@@ -43,8 +44,9 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 WIN_W, WIN_H = 1400, 920
 FPS     = 60
-BAUD    = 115200
-PANEL_W = 302
+BAUD     = 115200
+UDP_PORT = 4210
+PANEL_W  = 302
 VP_W    = WIN_W - PANEL_W      # ancho del viewport 3D
 VP_CX   = VP_W  // 2
 VP_CY   = WIN_H // 2
@@ -91,6 +93,32 @@ def serial_reader(port: str):
     except Exception as e:
         print(f"[Serial] Error: {e}")
         _set(connected=False)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hilo receptor UDP (WiFi)
+# ─────────────────────────────────────────────────────────────────────────────
+def udp_receiver():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(('', UDP_PORT))
+    sock.settimeout(2.0)
+    print(f"[UDP] Escuchando en puerto {UDP_PORT}")
+    _set(connected=True)
+    while True:
+        try:
+            data, addr = sock.recvfrom(512)
+            for line in data.decode('utf-8', errors='ignore').splitlines():
+                line = line.strip()
+                if line.startswith('>') and ':' in line:
+                    key, _, val = line[1:].partition(':')
+                    if key in _KEY_MAP:
+                        try: _set(**{_KEY_MAP[key]: float(val)})
+                        except ValueError: pass
+        except socket.timeout:
+            pass
+        except Exception as e:
+            print(f"[UDP] Error: {e}")
+            _set(connected=False)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Hilo demo (movimiento sintético)
@@ -312,6 +340,36 @@ def render_mini_axes(surf, cam_right, cam_up):
         f = pygame.font.SysFont('monospace', 11)
         surf.blit(f.render(lbl, True, col), (sx-4, sy-8))
 
+
+def render_g_meter(surf, acc_x, acc_y):
+    """Indicador de carga G lateral/longitudinal — esquina inferior izquierda."""
+    cx, cy, r = 75, WIN_H - 200, 52
+    g_mag = math.sqrt(acc_x ** 2 + acc_y ** 2)
+
+    # fondo
+    pygame.draw.circle(surf, (10, 12, 28), (cx, cy), r)
+    # anillos 0.5g y 1g
+    pygame.draw.circle(surf, (35, 55, 100), (cx, cy), r,        1)
+    pygame.draw.circle(surf, (35, 55, 100), (cx, cy), r // 2,   1)
+    # cruces
+    pygame.draw.line(surf, (35, 55, 100), (cx - r, cy), (cx + r, cy), 1)
+    pygame.draw.line(surf, (35, 55, 100), (cx, cy - r), (cx, cy + r), 1)
+
+    # punto G: accY = lateral (derecha+), accX = longitudinal (adelante+)
+    scale = r * 0.8
+    dot_x = int(cx + acc_y * scale)
+    dot_y = int(cy - acc_x * scale)
+    dot_x = max(cx - r + 6, min(cx + r - 6, dot_x))
+    dot_y = max(cy - r + 6, min(cy + r - 6, dot_y))
+
+    col = (255, 65, 65) if g_mag > 1.5 else (255, 200, 40) if g_mag > 0.5 else (0, 210, 90)
+    pygame.draw.circle(surf, col, (dot_x, dot_y), 7)
+    pygame.draw.circle(surf, (220, 220, 220), (cx, cy), 3)   # centro de referencia
+
+    f_sm = pygame.font.SysFont('monospace', 12, bold=True)
+    surf.blit(f_sm.render("G", True, (160, 185, 225)), (cx - 5, cy - r - 17))
+    surf.blit(f_sm.render(f"{g_mag:.2f}g", True, col),  (cx - 24, cy + r + 5))
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Panel de datos 2D (lado derecho)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -363,7 +421,7 @@ class Panel:
 
         # Desplazamiento vertical por cabeceo (45 ° = radio completo)
         pitch_px = max(-r, min(r, int(pitch * r / 45.0)))
-        horizon_y = half - pitch_px
+        horizon_y = half + pitch_px   # pitch>0 (nariz arriba) → horizonte baja
 
         # Contenido: cielo + tierra + línea de horizonte
         tmp = pygame.Surface((size, size))
@@ -462,12 +520,13 @@ class Panel:
         r_c  = 68
         c_cx = px + PANEL_W//2
         c_cy = self._y + r_c + 6
-        self._compass(surf, c_cx, c_cy, r_c, st['rumbo'], self.f_sm)
+        self._compass(surf, c_cx, c_cy, r_c, st['yaw'], self.f_sm)
 
-        dirs = ['N','NE','E','SE','S','SO','O','NO']
-        di   = int((st['rumbo']+22.5)/45) % 8
-        deg_s = self.f_lg.render(f"{st['rumbo']:05.1f}°", True, (255,210,55))
-        dir_s = self.f_lg.render(dirs[di],                True, (255,210,55))
+        dirs  = ['N','NE','E','SE','S','SO','O','NO']
+        hdg   = st['yaw'] % 360
+        di    = int((hdg + 22.5) / 45) % 8
+        deg_s = self.f_lg.render(f"{hdg:05.1f}°", True, (255,210,55))
+        dir_s = self.f_lg.render(dirs[di],         True, (255,210,55))
         surf.blit(deg_s, (c_cx - deg_s.get_width()//2, c_cy + r_c + 6))
         surf.blit(dir_s, (c_cx - dir_s.get_width()//2, c_cy + r_c + 30))
         self._y = c_cy + r_c + 60
@@ -542,10 +601,16 @@ def make_sky(w, h):
 def main():
     ap = argparse.ArgumentParser(description="Visualizador 3D IMU ESP32-S3-Nano")
     ap.add_argument('--port', help="Puerto serie (ej. /dev/ttyACM0, COM3)")
+    ap.add_argument('--udp',  action='store_true', help=f"Recibir datos por WiFi UDP (puerto {UDP_PORT})")
     ap.add_argument('--demo', action='store_true', help="Modo demo sin hardware")
     args = ap.parse_args()
 
-    if not args.demo:
+    if args.demo:
+        print("[Demo] Ejecutando en modo demostración (sin hardware).")
+        threading.Thread(target=demo_runner, daemon=True).start()
+    elif args.udp:
+        threading.Thread(target=udp_receiver, daemon=True).start()
+    else:
         if not SERIAL_OK:
             print("Instala pyserial:  pip install pyserial"); sys.exit(1)
         if args.port:
@@ -555,12 +620,9 @@ def main():
             port = next((p for p in ports if 'ACM' in p), None) or (ports[0] if ports else '/dev/ttyACM0')
         if not port:
             print("No se encontró puerto serie.")
-            print("Usa  --port /dev/ttyACM0  o  --demo  para modo sin hardware.")
+            print("Usa  --port /dev/ttyACM0  o  --udp  o  --demo")
             sys.exit(1)
         threading.Thread(target=serial_reader, args=(port,), daemon=True).start()
-    else:
-        print("[Demo] Ejecutando en modo demostración (sin hardware).")
-        threading.Thread(target=demo_runner, daemon=True).start()
 
     pygame.init()
     screen = pygame.display.set_mode((WIN_W, WIN_H))
@@ -618,6 +680,7 @@ def main():
         render_grid(screen, eye, cr, cu, cf, focal)
         render_airplane(screen, R, eye, cr, cu, cf, focal)
         render_mini_axes(screen, cr, cu)
+        render_g_meter(screen, st['acc_x'], st['acc_y'])
         panel.draw(screen, st, clock.get_fps())
 
         pygame.display.flip()
