@@ -12,6 +12,8 @@ Controles:
   Arrastrar (botón izq.) → orbitar cámara
   Rueda del ratón        → zoom
   R                      → reset cámara
+  C                      → calibrar magnetómetro (durante calibración inicial, por USB)
+  T                      → ocultar / mostrar ventana de estado y consola
   ESC                    → salir
 """
 import sys
@@ -21,6 +23,7 @@ import threading
 import time
 import argparse
 import socket
+from collections import deque
 
 # Fuerza Mesa software renderer — necesario cuando el driver NVIDIA
 # tiene mismatch de versiones entre kernel y librería (hasta próximo reboot).
@@ -46,9 +49,11 @@ WIN_W, WIN_H = 1400, 920
 FPS     = 60
 BAUD     = 115200
 UDP_PORT = 4210
-PANEL_W  = 302
-VP_W    = WIN_W - PANEL_W      # ancho del viewport 3D
-VP_CX   = VP_W  // 2
+PANEL_W  = 302                       # panel de datos (derecha)
+MAP_W    = 318                       # franja de mapa / posición (izquierda)
+VP_X0   = MAP_W                      # x donde empieza el viewport 3D
+VP_W    = WIN_W - PANEL_W - MAP_W    # ancho del viewport 3D (centro)
+VP_CX   = VP_X0 + VP_W // 2
 VP_CY   = WIN_H // 2
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,56 +74,118 @@ _KEY_MAP = {
     'BA': 'baro_alt', 'BP': 'baro_press', 'VZ': 'vel_z',
 }
 
+# ── Log de mensajes de estado (estilo terminal) y comando saliente ───────────
+_msg_lock = threading.Lock()
+_messages = deque(maxlen=200)          # mensajes >OK:/>CAL:/>ERR:/>ALIGN:… recibidos
+_serial   = None                       # handle serie compartido (para enviar 'C')
+_flags    = {'reset_origin': False}    # señales hilo lector → hilo render
+
 def _get():
     with _lock: return dict(_state)
 
 def _set(**kw):
     with _lock: _state.update(kw)
 
+def _log(msg: str):
+    """Añade una línea al log de estado con marca de tiempo."""
+    line = f"{time.strftime('%H:%M:%S')} {msg}"
+    with _msg_lock:
+        _messages.append(line)
+    print(f"[Log] {msg}")
+
+def _get_messages(n: int):
+    with _msg_lock:
+        return list(_messages)[-n:]
+
+def _ingest_line(line: str):
+    """Procesa una línea '>KEY:VAL'. Datos → estado; resto → log de estado."""
+    line = line.strip()
+    if not line.startswith('>') or ':' not in line:
+        return
+    key, _, val = line[1:].partition(':')
+    if key in _KEY_MAP:
+        try: _set(**{_KEY_MAP[key]: float(val)})
+        except ValueError: pass
+    else:
+        # Mensaje de inicio / calibración / error / alineación / etc.
+        _log(line[1:])
+        # '>OK:1' = sistema listo tras calibración → fijar origen del mapa (0,0,0)
+        if key == 'OK' and val.strip() == '1':
+            _flags['reset_origin'] = True
+
+def send_command(cmd: str):
+    """Envía un comando al ESP por serie (la ventana de calibración usa USB)."""
+    s = _serial
+    if s is not None:
+        try:
+            s.write(cmd.encode())
+            _log(f"→ Comando '{cmd}' enviado (calibrar magnetómetro)")
+        except Exception as e:
+            _log(f"Error enviando comando: {e}")
+    else:
+        _log("Comando 'C' requiere conexión USB serie (no disponible por UDP)")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Hilo lector serial
 # ─────────────────────────────────────────────────────────────────────────────
 def serial_reader(port: str):
-    try:
-        ser = serial.Serial(port, BAUD, timeout=2)
-        _set(connected=True)
-        print(f"[Serial] Conectado a {port} @ {BAUD} baudios")
-        while True:
-            line = ser.readline().decode('utf-8', errors='ignore').strip()
-            if line.startswith('>') and ':' in line:
-                key, _, val = line[1:].partition(':')
-                if key in _KEY_MAP:
-                    try: _set(**{_KEY_MAP[key]: float(val)})
-                    except ValueError: pass
-    except Exception as e:
-        print(f"[Serial] Error: {e}")
-        _set(connected=False)
+    """Lee la telemetría por serie. Si se pierde la conexión (p.ej. botón de
+    reset del ESP), reintenta abrir el puerto periódicamente hasta reconectar."""
+    global _serial
+    while True:
+        ser = None
+        try:
+            ser = serial.Serial(port, BAUD, timeout=2)
+            _serial = ser
+            _set(connected=True)
+            _log(f"Conectado a {port} @ {BAUD} baudios")
+            while True:
+                raw = ser.readline()
+                line = raw.decode('utf-8', errors='ignore').strip()
+                if line:
+                    _ingest_line(line)
+                # readline() vacío = timeout sin datos (normal durante
+                # calibración/alineación); seguimos esperando.
+        except Exception as e:
+            _serial = None
+            _set(connected=False)
+            _log(f"Conexión perdida: {e} — reintentando…")
+            try:
+                if ser is not None: ser.close()
+            except Exception:
+                pass
+            time.sleep(1.5)   # esperar a que el puerto reaparezca tras el reset
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Hilo receptor UDP (WiFi)
 # ─────────────────────────────────────────────────────────────────────────────
 def udp_receiver():
+    """Recibe telemetría por UDP. Detecta la pérdida de conexión (reset del ESP)
+    por ausencia de paquetes y marca DESCONECTADO; reconecta solo al volver."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(('', UDP_PORT))
-    sock.settimeout(2.0)
-    print(f"[UDP] Escuchando en puerto {UDP_PORT}")
-    _set(connected=True)
+    sock.settimeout(1.0)
+    _log(f"Escuchando UDP en puerto {UDP_PORT}")
+    last_data = 0.0
     while True:
         try:
             data, addr = sock.recvfrom(512)
+            if not _get()['connected']:
+                _log(f"Datos UDP recibidos de {addr[0]}")
+            _set(connected=True)
+            last_data = time.time()
             for line in data.decode('utf-8', errors='ignore').splitlines():
-                line = line.strip()
-                if line.startswith('>') and ':' in line:
-                    key, _, val = line[1:].partition(':')
-                    if key in _KEY_MAP:
-                        try: _set(**{_KEY_MAP[key]: float(val)})
-                        except ValueError: pass
+                _ingest_line(line)
         except socket.timeout:
-            pass
+            # Sin paquetes: si llevábamos tiempo conectados, marcar pérdida
+            if _get()['connected'] and (time.time() - last_data) > 3.0:
+                _set(connected=False)
+                _log("Sin datos UDP — esperando reconexión…")
         except Exception as e:
-            print(f"[UDP] Error: {e}")
             _set(connected=False)
+            _log(f"UDP error: {e} — reintentando…")
+            time.sleep(1.0)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Hilo demo (movimiento sintético)
@@ -328,8 +395,8 @@ def render_grid(surf, cam_eye, cam_right, cam_up, cam_fwd, focal):
                 pygame.draw.line(surf, col, pa_s, pb_s, 1)
 
 def render_mini_axes(surf, cam_right, cam_up):
-    """Ejes de referencia 2D fijos en esquina inferior izquierda."""
-    cx, cy = 75, WIN_H - 75
+    """Ejes de referencia 2D fijos en esquina inferior izquierda del viewport."""
+    cx, cy = VP_X0 + 75, WIN_H - 75
     length = 48
     for axis, col, lbl in [((1,0,0),(210,55,55),'X'),
                             ((0,1,0),(55,210,55),'Y'),
@@ -342,8 +409,8 @@ def render_mini_axes(surf, cam_right, cam_up):
 
 
 def render_g_meter(surf, acc_x, acc_y):
-    """Indicador de carga G lateral/longitudinal — esquina inferior izquierda."""
-    cx, cy, r = 75, WIN_H - 200, 52
+    """Indicador de carga G lateral/longitudinal — esquina inferior izq. del viewport."""
+    cx, cy, r = VP_X0 + 75, WIN_H - 200, 52
     g_mag = math.sqrt(acc_x ** 2 + acc_y ** 2)
 
     # fondo
@@ -582,8 +649,206 @@ class Panel:
         self._y += 8
         surf.blit(self.f_sm.render(f"FPS: {fps:.0f}", True,(75,85,115)),(px+10,self._y))
         self._y += 18
-        surf.blit(self.f_sm.render("[ESC] Salir  [R] Reset cámara", True,(65,75,105)),
+        surf.blit(self.f_sm.render("[ESC]Salir [R]Cám [C]Calib.mag [T]Consola", True,(65,75,105)),
                   (px+10,self._y))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Overlay de estado + consola de mensajes (esquina superior izquierda)
+# ─────────────────────────────────────────────────────────────────────────────
+def _msg_color(m: str):
+    u = m.upper()
+    if 'ERR' in u:                       return (255, 95, 95)
+    if 'CAL' in u or 'ALIGN' in u:       return (240, 210, 90)
+    if 'OK' in u or 'AP:' in u:          return (90, 220, 120)
+    return (155, 175, 215)
+
+def render_status_overlay(surf, st, f_status, f_msg, messages):
+    x, y   = VP_X0 + 10, 10
+    w      = 636
+    n      = len(messages)
+    head_h = 56
+    box_h  = head_h + n * 15 + 8
+
+    # Fondo semitransparente para legibilidad sobre la escena 3D
+    box = pygame.Surface((w, box_h), pygame.SRCALPHA)
+    box.fill((8, 10, 24, 205))
+    surf.blit(box, (x, y))
+    pygame.draw.rect(surf, (55, 75, 135), (x, y, w, box_h), 1)
+
+    # Línea de estado de conexión
+    ok  = st['connected']
+    col = (0, 215, 95) if ok else (255, 65, 65)
+    surf.blit(f_status.render("● CONECTADO" if ok else "● DESCONECTADO", True, col),
+              (x + 10, y + 8))
+
+    # Línea de instrucciones (debajo del estado)
+    surf.blit(f_msg.render("[C] Calibrar magnetómetro durante la calibración inicial",
+                           True, (185, 205, 120)), (x + 10, y + 32))
+
+    # Separador
+    pygame.draw.line(surf, (45, 60, 110), (x + 8, y + 50), (x + w - 8, y + 50), 1)
+
+    # Consola de mensajes (más antiguos arriba, más recientes abajo)
+    my = y + 56
+    for m in messages:
+        surf.blit(f_msg.render(m[:108], True, _msg_color(m)), (x + 10, my))
+        my += 15
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Estima de posición por dead-reckoning (mapa de la izquierda)
+# ─────────────────────────────────────────────────────────────────────────────
+_G        = 9.80665   # m/s² por g
+# ── Ajuste del peso de las aceleraciones en la posición ──────────────────────
+# Baja ACC_GAIN si el avión "vuela" demasiado lejos de lo real; sube si se mueve
+# de menos. VEL_DAMP < 1 sangra la velocidad cada frame para frenar la deriva.
+ACC_GAIN  = 0.02      # peso de las aceleraciones (↓ = menos movimiento)
+VEL_DAMP  = 0.90      # amortiguación de velocidad por frame (↓ = menos deriva)
+
+class DeadReckoning:
+    """Infiere la posición del avión integrando las aceleraciones.
+    - X (Este) e Y (Norte): doble integración de acc_x/acc_y (cuerpo) rotadas
+      por el rumbo (yaw) al marco mundo. Se usa solo el PRIMER DECIMAL de cada
+      aceleración (deadband) → en reposo no hay deriva.
+    - Z (altura): promedio de la altura barométrica y la doble integración de
+      acc_z (componente vertical, quitada la gravedad).
+    Origen (0,0,0) fijado en la fase de calibración."""
+
+    def __init__(self):
+        self.reset(0.0)
+
+    def reset(self, z_ref=0.0):
+        self.x = self.y = self.z = 0.0
+        self.vx = self.vy = self.vz = 0.0
+        self._z_acc = 0.0
+        self.z_ref  = z_ref          # altura barométrica en el instante del origen
+        self.trail  = deque(maxlen=4000)
+        self.trail.append((0.0, 0.0))
+
+    def update(self, dt, ax, ay, az, baro_alt, yaw_deg):
+        if dt <= 0.0 or dt > 0.5:    # ignora el primer frame y saltos largos
+            return
+
+        # Solo el primer decimal (deadband ~0.05 g): mata el ruido en reposo.
+        # ACC_GAIN reduce el peso de las aceleraciones para que la posición sea realista.
+        afx = round(ax, 1) * _G * ACC_GAIN   # longitudinal (morro)  cuerpo
+        afy = round(ay, 1) * _G * ACC_GAIN   # lateral (ala dcha.)   cuerpo
+
+        # Rotar cuerpo → mundo según rumbo (0°=Norte, horario)
+        psi     = math.radians(yaw_deg)
+        a_east  = afx * math.sin(psi) + afy * math.cos(psi)
+        a_north = afx * math.cos(psi) - afy * math.sin(psi)
+
+        self.vx = (self.vx + a_east  * dt) * VEL_DAMP
+        self.vy = (self.vy + a_north * dt) * VEL_DAMP
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+
+        # Vertical (filtro complementario): el BARÓMETRO da la altura absoluta y
+        # el acelerómetro solo una pequeña corrección de alta frecuencia.
+        a_up = (az + 1.0) * _G * ACC_GAIN
+        self.vz = (self.vz + a_up * dt) * VEL_DAMP
+        self._z_acc = (self._z_acc + self.vz * dt) * 0.99   # decae lento hacia 0
+        baro    = baro_alt - self.z_ref
+        self.z  = baro + self._z_acc
+
+        # Añadir al rastro solo si se ha movido lo suficiente (mapa limpio)
+        lx, ly = self.trail[-1]
+        if (self.x - lx) ** 2 + (self.y - ly) ** 2 > 0.0004:   # >0.02 m
+            self.trail.append((self.x, self.y))
+
+
+def _nice_step(span):
+    """Paso de rejilla 'bonito' (1,2,5×10ⁿ) ≈ span/5."""
+    raw = max(span / 5.0, 1e-6)
+    p   = 10 ** math.floor(math.log10(raw))
+    for m in (1, 2, 5, 10):
+        if m * p >= raw:
+            return m * p
+    return 10 * p
+
+
+def _render_map(surf, x, y, w, h, dr, st, f_sm):
+    surf.set_clip(pygame.Rect(x, y, w, h))
+    pygame.draw.rect(surf, (6, 18, 12), (x, y, w, h))
+
+    # Límites autoescala (rastro + actual + origen)
+    pts  = list(dr.trail) + [(dr.x, dr.y), (0.0, 0.0)]
+    xs   = [p[0] for p in pts]; ys = [p[1] for p in pts]
+    minx, maxx = min(xs), max(xs); miny, maxy = min(ys), max(ys)
+    span = max(maxx - minx, maxy - miny, 0.5) * 1.15   # escala mínima 0.5 m
+    cxw  = (minx + maxx) / 2.0;  cyw = (miny + maxy) / 2.0
+    pad  = 14
+    scale = (min(w, h) - 2 * pad) / span
+    cx, cy = x + w / 2.0, y + h / 2.0
+
+    def P(wx, wy):
+        return (int(cx + (wx - cxw) * scale), int(cy - (wy - cyw) * scale))
+
+    # Rejilla
+    step = _nice_step(span)
+    half = span / 2.0 * 1.1
+    k = math.floor((cxw - half) / step)
+    while k * step <= cxw + half:
+        sx = P(k * step, cyw)[0]
+        pygame.draw.line(surf, (22, 42, 30), (sx, y), (sx, y + h), 1)
+        k += 1
+    k = math.floor((cyw - half) / step)
+    while k * step <= cyw + half:
+        sy = P(cxw, k * step)[1]
+        pygame.draw.line(surf, (22, 42, 30), (x, sy), (x + w, sy), 1)
+        k += 1
+
+    # Origen (cruz ámbar)
+    ox, oy = P(0.0, 0.0)
+    pygame.draw.line(surf, (140, 100, 45), (ox - 6, oy), (ox + 6, oy), 1)
+    pygame.draw.line(surf, (140, 100, 45), (ox, oy - 6), (ox, oy + 6), 1)
+
+    # Rastro
+    if len(dr.trail) >= 2:
+        pygame.draw.lines(surf, (70, 205, 125), False, [P(px, py) for px, py in dr.trail], 2)
+
+    # Posición actual + flecha de rumbo
+    px, py = P(dr.x, dr.y)
+    psi    = math.radians(st['yaw'])
+    hx, hy = px + int(15 * math.sin(psi)), py - int(15 * math.cos(psi))
+    pygame.draw.line(surf, (255, 210, 55), (px, py), (hx, hy), 2)
+    pygame.draw.circle(surf, (255, 80, 80), (px, py), 4)
+
+    surf.set_clip(None)
+    pygame.draw.rect(surf, (40, 70, 50), (x, y, w, h), 1)
+    surf.blit(f_sm.render(f"{step:g} m/div   N↑", True, (120, 165, 120)), (x + 5, y + h - 16))
+
+
+def _render_position_window(surf, x, y, w, dr, st, f_md, f_sm):
+    pygame.draw.line(surf, (55, 75, 135), (x, y + 10), (x + w, y + 10), 1)
+    surf.blit(f_sm.render("POSICIÓN (m · ref. 0,0,0 en calib.)", True, (110, 160, 230)), (x, y))
+    y += 26
+    for lbl, val, clr in [("X Este ", dr.x, (255, 110, 110)),
+                          ("Y Norte", dr.y, (110, 230, 110)),
+                          ("Z Alt. ", dr.z, (110, 160, 255))]:
+        surf.blit(f_md.render(f"{lbl}: {val:+8.2f} m", True, clr), (x, y))
+        y += 25
+    y += 4
+    dist = math.hypot(dr.x, dr.y)
+    spd  = math.hypot(dr.vx, dr.vy)
+    surf.blit(f_sm.render(f"Dist. horiz.: {dist:7.2f} m",   True, (170, 190, 220)), (x, y)); y += 18
+    surf.blit(f_sm.render(f"Vel. horiz.:  {spd:7.2f} m/s",  True, (170, 190, 220)), (x, y)); y += 18
+
+
+def render_map_panel(surf, f_title, f_md, f_sm, dr, st):
+    pygame.draw.rect(surf, (10, 12, 30), (0, 0, MAP_W, WIN_H))
+    pygame.draw.line(surf, (55, 75, 145), (MAP_W, 0), (MAP_W, WIN_H), 2)
+
+    y = 14
+    t = f_title.render("MAPA / POSICIÓN", True, (85, 175, 255))
+    surf.blit(t, ((MAP_W - t.get_width()) // 2, y)); y += 32
+
+    m_pad = 12
+    m_w   = MAP_W - 2 * m_pad
+    _render_map(surf, m_pad, y, m_w, m_w, dr, st, f_sm)
+    y += m_w + 18
+
+    _render_position_window(surf, m_pad, y, m_w, dr, st, f_md, f_sm)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fondo (gradiente de cielo, pre-renderizado)
@@ -633,11 +898,25 @@ def main():
     clock  = pygame.time.Clock()
     focal  = (VP_W / 2) / math.tan(math.radians(22.5))
 
+    # Fuentes del overlay de estado/consola (esquina superior izquierda)
+    f_ov_status = pygame.font.SysFont('monospace', 15, bold=True)
+    f_ov_msg    = pygame.font.SysFont('monospace', 12)
+
+    # Fuentes de la franja de mapa / posición (izquierda)
+    f_map_title = pygame.font.SysFont('monospace', 18, bold=True)
+    f_map_md    = pygame.font.SysFont('monospace', 16)
+    f_map_sm    = pygame.font.SysFont('monospace', 12)
+
+    # Estima de posición por dead-reckoning
+    dr      = DeadReckoning()
+    last_dr = time.time()
+
     # Estado de cámara (esférico)
     cam_yaw, cam_pitch, cam_dist = 200.0, 22.0, 11.0
     DEF_CAM = (200.0, 22.0, 11.0)
     dragging  = False
     last_pos  = (0, 0)
+    show_overlay = True   # ventanita de estado/consola (tecla T)
 
     while True:
         for ev in pygame.event.get():
@@ -648,8 +927,12 @@ def main():
                     pygame.quit(); sys.exit()
                 if ev.key == pygame.K_r:
                     cam_yaw, cam_pitch, cam_dist = DEF_CAM
+                if ev.key == pygame.K_c:
+                    send_command('C')   # disparar calibración del magnetómetro
+                if ev.key == pygame.K_t:
+                    show_overlay = not show_overlay   # ocultar/mostrar ventanita
             if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
-                if ev.pos[0] < VP_W:
+                if VP_X0 <= ev.pos[0] < VP_X0 + VP_W:
                     dragging = True; last_pos = ev.pos
             if ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
                 dragging = False
@@ -662,6 +945,15 @@ def main():
                 cam_dist = max(4.0, min(28.0, cam_dist - ev.y * 0.6))
 
         st = _get()
+
+        # ── Dead-reckoning: integrar posición con el dt real del frame ───────
+        now = time.time()
+        dt_dr, last_dr = now - last_dr, now
+        if _flags['reset_origin']:
+            dr.reset(z_ref=st['baro_alt'])
+            _flags['reset_origin'] = False
+            _log("Origen de posición fijado en (0,0,0)")
+        dr.update(dt_dr, st['acc_x'], st['acc_y'], st['acc_z'], st['baro_alt'], st['yaw'])
 
         # Calcular posición de cámara
         cy_r = math.radians(cam_pitch)
@@ -676,11 +968,14 @@ def main():
         R = imu_matrix(st['roll'], st['pitch'], st['yaw'])
 
         # ── Dibujado ──────────────────────────────────────────────────────
-        screen.blit(sky, (0, 0))
+        screen.blit(sky, (VP_X0, 0))
         render_grid(screen, eye, cr, cu, cf, focal)
         render_airplane(screen, R, eye, cr, cu, cf, focal)
         render_mini_axes(screen, cr, cu)
         render_g_meter(screen, st['acc_x'], st['acc_y'])
+        if show_overlay:
+            render_status_overlay(screen, st, f_ov_status, f_ov_msg, _get_messages(16))
+        render_map_panel(screen, f_map_title, f_map_md, f_map_sm, dr, st)
         panel.draw(screen, st, clock.get_fps())
 
         pygame.display.flip()

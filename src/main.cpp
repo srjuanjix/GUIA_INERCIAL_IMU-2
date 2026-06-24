@@ -34,7 +34,7 @@
 
 // ── Definición del pin del LED y variable global de error ────────────────────── (GPIO 21 )
 
-const int LED_PIN = 21;
+const int LED_PIN = 10;
 
 
 // 0 = Sin error. (Led apagado)
@@ -68,6 +68,9 @@ static void servoWrite(int deg) {
 const float KP = 2.0f, KI = 0.3f, KD = 0.15f;
 const float I_MAX = 20.0f, OUT_MAX = 45.0f;
 float pidIntegral = 0.0f;
+
+// ── EKF: tiempo de la última predicción ──────────────────────────────────────
+static unsigned long tEkfPrev = 0;
 
 // ── Sensores ──────────────────────────────────────────────────────────────────
 MPU9250         mpu;
@@ -134,6 +137,9 @@ static float P6[6][6]   = {};
 static float rollOff_r  = 0.0f;
 static float pitchOff_r = 0.0f;
 static float yawOff_r   = 0.0f;
+static float accBias_x  = 0.0f;   // bias eje X del chip en reposo (~0.25 g electrónico)
+static float accBias_y  = 0.0f;   // bias eje Y del chip en reposo
+static float accBias_z  = 0.0f;   // bias eje Z del chip en reposo (incluye ~1 g de gravedad)
 
 // Ruidos de proceso
 static const float Q_ANG  = 1e-5f;   // varianza proceso: ángulos    (rad²/s)
@@ -286,7 +292,8 @@ static void ekf_update_mahony(float roll_m, float pitch_m, float yaw_m) {
 }
 // 
 // ── Función encargada de gestionar el LED mediante máquina de estados ────────────────
-// 0 = Sin error. (Led apagado)
+// 
+// 0 = Sin error. (Led encendido 1 s y luego apagado)
 // 1 = Error de Telemetría (Parpadeo lento de vida)
 // 2 = Error de IMU / Sensor MPU9250-6500 (Parpadeo rápido)
 // 3 = Error de sensor barometro GY-68 (Patrón de doble destello)
@@ -313,24 +320,22 @@ void actualizarLedEstado() {
             }
             break;
 
-        case 3: // ----  Error de sensor barometro GY-68 (Doble destello sofisticado) ----
-            // Creamos una secuencia: ON(100ms) -> OFF(100ms) -> ON(100ms) -> OFF(700ms)
-            unsigned long intervaloActual;
-            
-            if (fasePatron == 0 || fasePatron == 2) intervaloActual = 100; // Tiempo encendido
-            else if (fasePatron == 1) intervaloActual = 100;               // Pausa corta entre destellos
-            else intervaloActual = 700;                                    // Pausa larga antes de repetir
-
-            if (tiempoActual - tiempoAnteriorLED >= intervaloActual) {
+        case 3: { // ----  Error de sensor barometro GY-68 (Doble destello sofisticado) ----
+            // Secuencia: ON(100ms) → OFF(100ms) → ON(100ms) → OFF(700ms) → repetir
+            static const unsigned long T[4] = {100, 100, 100, 700};
+            if (!estadoLED && fasePatron == 0) {
+                // Primera entrada: encender LED inmediatamente y arrancar temporizador
+                estadoLED = true;
                 tiempoAnteriorLED = tiempoActual;
-                
-                fasePatron = (fasePatron + 1) % 4; // Avanza de la fase 0 a la 3 y reinicia
-                
-                // Las fases pares encienden, las impares apagan
+                digitalWrite(LED_PIN, HIGH);
+            } else if (tiempoActual - tiempoAnteriorLED >= T[fasePatron]) {
+                tiempoAnteriorLED = tiempoActual;
+                fasePatron = (fasePatron + 1) % 4;
                 estadoLED = (fasePatron == 0 || fasePatron == 2);
-                digitalWrite(LED_PIN, estadoLED);
+                digitalWrite(LED_PIN, estadoLED ? HIGH : LOW);
             }
             break;
+        }
 
         case 4: // ---- Error Crítico de servos (LED Fijo) ----
             if (!estadoLED) {
@@ -346,7 +351,12 @@ void actualizarLedEstado() {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
+    // ..............................
     pinMode(LED_PIN, OUTPUT);                           // Led de mensajes de error
+    digitalWrite(LED_PIN, 1);                           // Enciende 2 S
+    delay(2000);
+    digitalWrite(LED_PIN, 0);                           // Apaga led de errores
+    // ..............................
     Serial.begin(115200);
     unsigned long t = millis();
     while (!Serial && millis() - t < 3000) yield();
@@ -370,8 +380,9 @@ void setup() {
     cfg.accel_dlpf_cfg   = ACCEL_DLPF_CFG::DLPF_45HZ;
 
     if (!mpu.setup(0x68, cfg)) {
-        while (1) { Serial.println(">ERR:MPU"); delay(500); }
         codigoError = 2;
+        Serial.println(">ERR:MPU - IMU no encontrada");
+        while (1) { actualizarLedEstado(); delay(50); }
     }
     Serial.println(">OK:MPU9250@0x68");
 
@@ -381,32 +392,60 @@ void setup() {
     Serial.println(">CAL:accel+gyro done");
 
     // ── Calibración magnetómetro opcional ────────────────────────────────────
-    Serial.println(">CAL:envia 'M' en 5s para calibrar mag (figura-8)");
+    Serial.println(">CAL:pulsa 'C' (o envia 'M') en 5s para calibrar mag (figura-8)");
     unsigned long tWait = millis();
     while (millis() - tWait < 5000) {
-        if (Serial.available() && Serial.read() == 'M') {
-            Serial.println(">CAL:mag - mueve en figura-8 ~15s...");
-            mpu.calibrateMag();
-            Serial.println(">CAL:mag done");
-            break;
+        mpu.update();   // mantener el filtro corriendo durante la espera
+        if (Serial.available()) {
+            char c = Serial.read();
+            if (c == 'C' || c == 'M') {
+                Serial.println(">CAL:mag - mueve en figura-8 ~15s...");
+                mpu.calibrateMag();
+                Serial.println(">CAL:mag done");
+                break;
+            }
         }
         delay(50);
     }
 
-    // ── Convergencia del filtro Mahony 5 s → captura orientación absoluta ─────
-    Serial.println(">ALIGN:esperando 5s convergencia Mahony...");
+    // ── Convergencia Madgwick 10 s + promedio 2 s → referencia estable en 0° ───
+    Serial.println(">ALIGN:esperando 12s convergencia Mahony...");
     unsigned long tAlign = millis();
-    while (millis() - tAlign < 5000) {
+    while (millis() - tAlign < 10000) {  // 10 s de convergencia
         mpu.update();
         delay(10);
     }
-    rollOff_r  = mpu.getRoll()  * DEG_TO_RAD;
-    pitchOff_r = mpu.getPitch() * DEG_TO_RAD;
-    yawOff_r   = mpu.getYaw()   * DEG_TO_RAD;
+    // Promedio del último segundo: elimina ruido puntual y captura bias del acelerómetro
+    float sumRoll = 0.0f, sumPitch = 0.0f, sumYsin = 0.0f, sumYcos = 0.0f;
+    float sumAX   = 0.0f, sumAY   = 0.0f, sumAZ   = 0.0f;
+    int   nSamples = 0;
+    unsigned long tAvg = millis();
+    while (millis() - tAvg < 2000) {
+        mpu.update();
+        sumRoll  += mpu.getRoll();
+        sumPitch += mpu.getPitch();
+        float yr  = mpu.getYaw() * DEG_TO_RAD;
+        sumYsin  += sinf(yr);
+        sumYcos  += cosf(yr);
+        sumAX    += mpu.getAccX();
+        sumAY    += mpu.getAccY();
+        sumAZ    += mpu.getAccZ();
+        nSamples++;
+        delay(10);
+    }
+    rollOff_r  = (sumRoll  / nSamples) * DEG_TO_RAD;
+    pitchOff_r = (sumPitch / nSamples) * DEG_TO_RAD;
+    yawOff_r   = atan2f(sumYsin / nSamples, sumYcos / nSamples);
+    accBias_x  = sumAX / nSamples;           // ~0.25 g (solo bias electrónico, eje horizontal)
+    accBias_y  = sumAY / nSamples;           // ~0.25 g (solo bias electrónico, eje horizontal)
+    accBias_z  = sumAZ / nSamples + 1.0f;    // solo bias electrónico: se resta la gravedad esperada (-1 g)
 
     Serial.print(">ALIGN:ref roll=");  Serial.print(rollOff_r  * RAD_TO_DEG, 2);
     Serial.print(" pitch=");           Serial.print(pitchOff_r * RAD_TO_DEG, 2);
     Serial.print(" yaw=");             Serial.println(yawOff_r * RAD_TO_DEG, 2);
+    Serial.print(">ALIGN:accBias X="); Serial.print(accBias_x, 4);
+    Serial.print(" Y=");               Serial.print(accBias_y, 4);
+    Serial.print(" Z=");               Serial.println(accBias_z, 4);
 
     // EKF arranca en la orientación absoluta real → salida = diferencia = 0
     ekf_init(rollOff_r, pitchOff_r, yawOff_r);
@@ -443,15 +482,16 @@ void setup() {
     Serial.print(">AP:"); Serial.print(AP_SSID);
     Serial.print(" IP:"); Serial.println(apIP);
 
+    tEkfPrev = millis();   // evita dt artificialmente grande en la primera iteración
     Serial.println(">OK:1");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-static unsigned long tEkfPrev = 0;
 // ..............................................................................
 // _______________ CICLO PRINCIPAL DEL PROGRAMA _________________________________
 // ..............................................................................
 void loop() {
+    actualizarLedEstado();           // Siempre se ejecuta, independiente del estado del sensor
     if (!mpu.update()) return;
 
     unsigned long ahora = millis();
@@ -463,7 +503,18 @@ void loop() {
     float gy_r = mpu.getGyroY() * DEG_TO_RAD;
     float gz_r = mpu.getGyroZ() * DEG_TO_RAD;
 
-    // ── EKF: predecir con giroscopio, corregir con Mahony ────────────────────
+    // ── Aceleraciones corregidas de bias ─────────────────────────────────────
+    // En reposo plano: AX=0.0, AY=0.0, AZ=-1.0 (gravedad en -Z del chip)
+    float acc_x = mpu.getAccX() - accBias_x;
+    float acc_y = mpu.getAccY() - accBias_y;
+    float acc_z = mpu.getAccZ() - accBias_z;
+
+    // ── EKF: predecir con giroscopio, corregir con la fusión del MPU ──────────
+    // La medición (φ,θ,ψ) es la salida del filtro Madgwick de la librería, que
+    // fusiona ACELERÓMETRO + GIROSCOPIO + MAGNETÓMETRO y resuelve la geometría de
+    // ejes del hardware. Por tanto el yaw que entra al Kalman ya está alimentado
+    // por el magnetómetro (referencia de norte magnético).
+    // El EKF estima el sesgo residual del giróscopo y suaviza la salida.
     ekf_predict(gx_r, gy_r, gz_r, dt);
     ekf_update_mahony(mpu.getRoll()  * DEG_TO_RAD,
                       mpu.getPitch() * DEG_TO_RAD,
@@ -481,28 +532,19 @@ void loop() {
     float p_term = KP * error;
     pidIntegral  = constrain(pidIntegral + error * dt, -I_MAX / KI, I_MAX / KI);
     float i_term = KI * pidIntegral;
-    // D-term con tasa de cabeceo dessesgada por el EKF
+    // D-term: tasa de cabeceo del giróscopo con sesgo estimado por EKF
     float d_term = KD * (-(gy_r - x6[4]) * RAD_TO_DEG);
     float output = constrain(p_term + i_term + d_term, -OUT_MAX, OUT_MAX);
     int   angulo = (int)constrain(90.0f + output, 45.0f, 135.0f);
     servoWrite(angulo);
 
-    // ── Aceleración dinámica: restamos la gravedad proyectada en ejes cuerpo ─────
-    // grav_x = −sin(θ),  grav_y = sin(φ)·cos(θ),  grav_z = cos(φ)·cos(θ)
-    // Con ángulos ABSOLUTOS del EKF → dyn ≈ 0 en reposo sea cual sea la orientación
-    float sp   = sinf(x6[0]), cp = cosf(x6[0]);
-    float st   = sinf(x6[1]), ct_g = cosf(x6[1]);
-    float dyn_x = mpu.getAccX() + st;          // acc_x − (−sin θ)
-    float dyn_y = mpu.getAccY() - sp * ct_g;   // acc_y − sin φ·cos θ
-    float dyn_z = mpu.getAccZ() - cp * ct_g;   // acc_z − cos φ·cos θ  (0 en reposo, ±Δg en maniobras)
-
     // ── Envío serial + UDP ────────────────────────────────────────────────────
     send("R",   roll,   1);
     send("P",   pitch,  1);
     send("Y",   yaw,    1);
-    send("AX",  dyn_x,  3);
-    send("AY",  dyn_y,  3);
-    send("AZ",  dyn_z,  3);
+    send("AX",  acc_x,  3);
+    send("AY",  acc_y,  3);
+    send("AZ",  acc_z,  3);
     sendInt("SRV", angulo);
 
     // ── BMP180: lectura cada 150 ms con filtro EMA ────────────────────────────
@@ -528,8 +570,7 @@ void loop() {
         send("Tmp", temp,   1);
         send("VZ",  vel_z,  3);
     }
-    actualizarLedEstado();          // 2. GESTIÓN DEL LED DE ESTADO (No bloqueante)
-    udpFlush();       
+    udpFlush();
 }
 // ..............................................................................
 // _______________ FIN CICLO PRINCIPAL DEL PROGRAMA _____________________________

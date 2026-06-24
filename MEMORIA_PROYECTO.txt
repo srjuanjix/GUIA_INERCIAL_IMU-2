@@ -1,0 +1,181 @@
+================================================================================
+  GUÍA INERCIAL IMU-3  ·  MEMORIA DEL PROYECTO
+  Sistema de navegación inercial para avión de ala fija (ESP32-S3-NANO)
+  Última actualización: 2026-06-23
+================================================================================
+
+--------------------------------------------------------------------------------
+1. RESUMEN DEL SISTEMA
+--------------------------------------------------------------------------------
+- Microcontrolador: ESP32-S3-NANO (proyecto PlatformIO).
+- Sensor inercial: MPU-9250/6500 (9 ejes: acelerómetro + giroscopio + magnetómetro)
+  en dirección I2C 0x68.
+- Barómetro: BMP180 en I2C 0x77 (altitud, presión, temperatura).
+- Salidas: telemetría por USB serie y por WiFi (modo AP + broadcast UDP, puerto 4210).
+  Control de servo (timón de profundidad) por LEDC con PID.
+- LED de estado en GPIO 10 (D10) con máquina de estados de códigos de error.
+- Fusión de actitud: filtro Madgwick de la librería (acel+giro+mag) → su salida
+  (roll/pitch/yaw) alimenta un EKF de 6 estados que estima el sesgo del giróscopo.
+- Visualizador en PC: imu_visualizer.py (pygame), render 3D + paneles de datos.
+
+Archivos principales:
+  - src/main.cpp           → firmware del ESP32.
+  - imu_visualizer.py      → visualizador 3D en tiempo real (PC).
+
+
+--------------------------------------------------------------------------------
+2. DIAGNÓSTICO CRÍTICO: EJE Z DEL ACELERÓMETRO DAÑADO
+--------------------------------------------------------------------------------
+SÍNTOMAS observados:
+  - Roll no lineal: a 45° físicos reales el sensor reportaba ~90°.
+  - Asimetría: roll positivo mal (el doble), roll negativo casi correcto.
+  - Acoplamiento: al girar solo en roll (p. ej. 90°), el pitch subía ~30°.
+
+PROCESO DE DIAGNÓSTICO (descartando causas una a una):
+  1. Se verificó que la extracción de ángulos de Euler de la librería
+     (update_rpy, Tait-Bryan ZYX) es matemáticamente correcta y desacoplada.
+  2. Se descartó el magnetómetro: con el filtro forzado a 6 ejes (Mahony, sin mag)
+     el problema persistía → no era el mag.
+  3. Se descartó la calibración de la librería: desactivando calibrateAccelGyro()
+     el resultado no cambiaba (la calibración solo escribe offsets, no escala).
+  4. PRUEBA CLAVE — magnitud del vector aceleración:
+     La magnitud sqrt(AX²+AY²+AZ²) DEBE ser ≈ 1.0 g en cualquier posición estática
+     (en reposo solo actúa la gravedad). Mediciones estáticas (avión apoyado en mesa):
+        · Plano:        AX=0.00  AY=0.00  AZ=-1.00  → |a| = 1.00 g  OK
+        · Roll +90°:    AX=-0.03 AY=+1.01 AZ=-1.85  → |a| = 2.11 g  IMPOSIBLE
+     Los ejes X e Y respondían perfectamente; todo el exceso estaba en Z.
+
+CONCLUSIÓN:
+  El eje Z del acelerómetro está DAÑADO (escala invertida ≈ -0.9 en vez de +1.0).
+  Modelo ajustado a los datos: acc_z(φ) = k·Z_grav(φ) + (k-1), con k ≈ -0.9.
+  Como roll y pitch se calculan AMBOS a partir de Z, un Z averiado los corrompe
+  → origen de TODOS los síntomas. NO era un bug de software.
+
+  Nota: el "AZ = -1.0 en plano" es engañoso, lo fuerza la corrección de bias
+  (accBias_z = mediaZ_plano + 1). El fallo solo se ve al inclinar y midiendo el
+  avión APOYADO (no a mano, que añade aceleración dinámica y también falsea).
+
+DECISIÓN DEL USUARIO: reemplazar el módulo MPU por uno sano.
+
+VERIFICACIÓN DE UN MPU NUEVO (30 s):
+  Apoyar el avión quieto en plano y luego con un ala abajo (roll 90°).
+  La magnitud sqrt(AX²+AY²+AZ²) debe mantenerse ≈ 1.0 g en ambas posiciones.
+  Si se mantiene → eje Z sano → roll/pitch saldrán lineales y desacoplados.
+
+
+--------------------------------------------------------------------------------
+3. ESTADO DEL FIRMWARE (src/main.cpp)
+--------------------------------------------------------------------------------
+Cadena de estimación de actitud:
+    mag  ┐
+    acc  ┼► Madgwick (librería) ► getRoll/getPitch/getYaw ► EKF 6 estados ► salida
+    gyro ┘                                                     ▲
+    gyro ───────────────────────────────► ekf_predict ────────┘
+
+  - EKF estado x6 = [φ, θ, ψ, b_p, b_q, b_r] (ángulos + sesgos del giróscopo).
+  - El magnetómetro YA alimenta el Kalman vía getYaw() (Madgwick fusiona acel+giro+mag).
+    Aunque la función se llame ekf_update_mahony, la medición viene de Madgwick.
+  - La salida resta offsets de alineación capturados al arranque → todo empieza en 0°.
+
+Detalles importantes de la librería hideakitai/MPU9250:
+  - Filtro POR DEFECTO = Madgwick (requiere magnetómetro válido). Es el correcto
+    para este sensor de 9 ejes. NO cambiar a Mahony (6 ejes, ignora el mag).
+  - calibrateAccelGyro() solo escribe offsets (no escala) y maneja bien Z negativo.
+
+Calibración del magnetómetro (en setup, ventana de 5 s):
+  - Se dispara enviando 'C' (o 'M') por el puerto serie durante esa ventana.
+  - Luego mover el sensor en figura-8 ~15 s.
+  - IMPORTANTE: el WiFi/UDP arranca DESPUÉS de esta ventana, por lo que el comando
+    de calibración solo puede llegar por USB serie (por UDP el ESP aún no escucha).
+
+LED de estado (GPIO 10):
+  0 = sin error (encendido 2 s al inicio y luego apagado).
+  1 = error de telemetría (parpadeo lento ~1 s).
+  2 = error de IMU / MPU no encontrada (parpadeo rápido 150 ms).
+  3 = error de barómetro BMP180 (doble destello).
+  4 = error crítico de servos (LED fijo).
+
+
+--------------------------------------------------------------------------------
+4. VISUALIZADOR (imu_visualizer.py)
+--------------------------------------------------------------------------------
+Ejecución:
+  python imu_visualizer.py            → autodetecta puerto serie (USB)
+  python imu_visualizer.py --port /dev/ttyACM0
+  python imu_visualizer.py --udp      → recibe por WiFi UDP (puerto 4210)
+  python imu_visualizer.py --demo     → modo demo sin hardware
+Requisitos: pip install pygame pyserial
+
+CONTROLES DE TECLADO:
+  Arrastrar (botón izq.) → orbitar cámara (solo dentro del viewport 3D)
+  Rueda del ratón        → zoom
+  R → reset cámara
+  C → calibrar magnetómetro (durante la calibración inicial; requiere USB serie)
+  T → ocultar / mostrar la ventana de estado y consola
+  ESC → salir
+
+LAYOUT (tres franjas):
+  - Izquierda  (franja MAP_W=318 px): MAPA de trayectoria + ventana de POSICIÓN.
+  - Centro     (viewport): render 3D del avión, rejilla, mini-ejes, medidor-G,
+                           y overlay de estado/consola (esquina superior, toggle T).
+  - Derecha    (panel PANEL_W=302 px): ángulos de Euler, aceleraciones, horizonte
+                           artificial, rumbo (brújula), altímetro barométrico.
+
+FUNCIONES AÑADIDAS EN ESTA SESIÓN:
+
+  a) Reconexión automática tras reset del ESP:
+     - Serie: si se pierde el puerto (botón de reset → cae el USB), reintenta abrir
+       cada 1.5 s hasta reconectar.
+     - UDP: detecta la pérdida por ausencia de paquetes (>3 s) y marca DESCONECTADO;
+       vuelve a CONECTADO solo cuando llegan datos de nuevo.
+
+  b) Overlay de estado + consola (esquina superior izquierda del viewport):
+     - Línea de estado de conexión (● CONECTADO / DESCONECTADO).
+     - Línea de instrucciones: [C] Calibrar magnetómetro durante la calibración inicial.
+     - Consola estilo terminal: últimos 16 mensajes del ESP (>OK/CAL/ERR/ALIGN/BMP/AP…)
+       con marca de tiempo y color por tipo (rojo=error, amarillo=calibración, verde=ok).
+     - Se oculta/muestra con la tecla T (el log sigue actualizándose por debajo).
+
+  c) Tecla 'C' → envía el comando de calibración del magnetómetro al ESP por serie.
+
+  d) Franja izquierda — MAPA + POSICIÓN (dead-reckoning):
+     - Mapa de trayectoria vista cenital, autoescalado (rejilla con paso 1/2/5 m),
+       Norte arriba, rastro del recorrido, origen (cruz ámbar), posición actual
+       (punto rojo) con flecha de rumbo.
+     - Ventana de posición: X (Este), Y (Norte), Z (altura) en metros respecto al
+       origen (0,0,0), más distancia y velocidad horizontales.
+
+  e) Física de la posición (clase DeadReckoning):
+     - X/Y: doble integración de acc_x/acc_y, usando solo el PRIMER DECIMAL de cada
+       aceleración (deadband → sin deriva en reposo), rotadas por el rumbo (yaw) a
+       marco mundo Este/Norte, con amortiguación.
+     - Z: filtro complementario → el BARÓMETRO da la altura absoluta y el acelerómetro
+       solo una pequeña corrección de alta frecuencia.
+     - Origen (0,0,0) se fija automáticamente al recibir '>OK:1' (fin de calibración),
+       capturando la altura barométrica de referencia. Se re-fija tras un reset del ESP.
+
+  f) Ajuste del peso de las aceleraciones (constantes arriba del archivo):
+     - ACC_GAIN = 0.02  → peso de las aceleraciones en la posición.
+                          (Bajar si el avión se mueve de más; subir si se mueve de menos.)
+     - VEL_DAMP = 0.90  → amortiguación de velocidad por frame (frena la deriva).
+     - Escala mínima del mapa: 0.5 m (para ver movimientos pequeños, de centímetros).
+
+LIMITACIÓN HONESTA del dead-reckoning:
+  La posición horizontal por doble integración de un acelerómetro de consumo DERIVA
+  con el tiempo (física inevitable sin GPS). El deadband, la ganancia y la amortiguación
+  lo mitigan, y la altura se ancla al barómetro, pero la posición horizontal es una
+  ESTIMACIÓN aproximada, mejor en tramos cortos.
+
+
+--------------------------------------------------------------------------------
+5. PENDIENTE / PRÓXIMOS PASOS
+--------------------------------------------------------------------------------
+  - Montar el MPU nuevo y verificar el eje Z con la prueba de magnitud (sección 2).
+  - Con el sensor sano, comprobar que roll/pitch salen lineales y desacoplados.
+  - Afinar ACC_GAIN al valor que mejor refleje el movimiento real del avión.
+  - (Opcional) Calibrar el magnetómetro al arrancar (tecla 'C' + figura-8) y
+    comprobar la linealidad del rumbo.
+
+================================================================================
+  Fin de la memoria.
+================================================================================
